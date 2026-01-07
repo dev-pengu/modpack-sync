@@ -1,8 +1,8 @@
+mod curse_files;
+use serde::{Deserialize, Serialize};
 use anyhow::{anyhow, Ok, Result};
 use reqwest;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use reqwest::header::{HeaderMap, HeaderValue};
 use std::env;
 use std::fs::{self, create_dir_all, remove_dir_all, File};
 use std::io::copy;
@@ -17,7 +17,6 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize)]
 struct Mod {
-    authors: Vec<String>,
     filename: String,
     name: String,
     url: String,
@@ -44,37 +43,27 @@ fn sync_mods(mods_dir: &String, path: &String, mods_file: &String, api_key: &Str
         let project_id = url_parts
             .last()
             .expect("expected project_id to not be empty");
-        let file_id = get_file_id(project_id, &m.filename, &api_key)
-            .expect("expected to receive a valid file id");
-        println!("file id is {}", file_id);
-        download_file(project_id, file_id, m.filename, mods_dir.clone(), &api_key)
-            .expect("expected to download the jar file")
+        let file_id = get_file_id(project_id, &m.filename, &api_key);
+        if file_id.is_err() {
+            println!(" -----> [ERR!] couldn't find file for {}. file may have been removed!", &m.filename);
+            continue;
+        }
+        let download_res = download_file(project_id, file_id.unwrap(), &m.filename, mods_dir.clone(), &api_key);
+        if download_res.is_err() {
+            println!(" -----> [ERR!] failed to download file: {}", &m.filename);
+            println!("        {:?}", download_res.err());
+        }
     }
     return Ok(());
 }
 
 fn get_file_id(project_id: &str, filename: &String, api_key: &String) -> Result<u64> {
     println!("attempting to find file {}", filename);
-    let client = reqwest::blocking::Client::new();
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert("X-Api-Token", HeaderValue::from_str(&api_key)?);
-
-    let url = format!(
-        "https://www.curseforge.com/api/v1/mods/{}/files?pageIndex=0&pageSize=100&sort=dateCreated&sortDescending=true",
-        project_id
-    );
-
-    let body = client.get(&url).headers(headers).send()?.json::<Value>();
-
-    for f in body?["data"].as_array().unwrap().into_iter() {
-        if f.get("fileName").unwrap().as_str().unwrap() == filename.as_str() {
+    for f in curse_files::CurseFile::of(&project_id, &api_key)? {
+        let file = f?;
+        if file.file_name.as_str() == filename.as_str() {
             println!(" -----> matching file found, will now attempt to download mod file");
-            return Ok(f
-                .get("id")
-                .unwrap()
-                .as_u64()
-                .expect("expected to find a valid file id"));
+            return Ok(file.id);
         }
     }
 
@@ -87,7 +76,7 @@ fn get_file_id(project_id: &str, filename: &String, api_key: &String) -> Result<
 fn download_file(
     project_id: &str,
     file_id: u64,
-    filename: String,
+    filename: &str,
     dir: String,
     api_key: &String,
 ) -> Result<()> {
@@ -107,11 +96,19 @@ fn download_file(
     let resp = client
         .get(&url)
         .headers(headers)
-        .send()
-        .expect(format!("request to get file {} failed", file_id).as_str());
-    let mut out = File::create(format!("{}/{}", dir, filename)).expect("failed to create file");
-    let content = resp.bytes().expect("expected to receive bytes to write");
-    copy(&mut content.as_ref(), &mut out)?;
+        .send();
+    if resp.is_err() {
+        return Err(anyhow!("request to get file {} failed", file_id));
+    }
+    let out = File::create(format!("{}/{}", dir, filename));
+    if out.is_err() {
+        return Err(anyhow!("failed to create jar file"));
+    }
+    let content = resp?.bytes();
+    if content.is_err() {
+        return Err(anyhow!("no file content to write"));
+    }
+    copy(&mut content?.as_ref(), &mut out?)?;
 
     println!(" -----> successfully downloaded {}", filename);
     return Ok(());
@@ -135,7 +132,7 @@ impl Config {
         let api_key = env::var("CURSE_API_KEY").unwrap();
 
         let mods_file = "modlist.json".to_string();
-        let mods_dir = format!("{}/minecraft/mods", base_dir);
+        let mods_dir = format!("{}/.minecraft/mods", base_dir);
 
         Ok(Config {
             api_key,
