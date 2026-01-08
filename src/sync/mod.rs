@@ -5,9 +5,9 @@ use anyhow::{anyhow, Ok, Result};
 use reqwest;
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::env;
-use std::fs::{self, create_dir_all, remove_file, File, OpenOptions};
+use std::fs::{self, create_dir_all, File, OpenOptions};
 use std::io::{copy, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Config {
     pub api_key: String,
@@ -55,20 +55,41 @@ fn sync_mods(mods_dir: &String, path: &String, mods_file: &String, api_key: &Str
         .expect("Should have been able to read the file");
     let mods: Vec<Mod> = serde_json::from_str(contents.as_str())
         .expect("Should have received correctly formatted json file");
-    for m in mods.into_iter() {
+
+    let mods_path = Path::new(&mods_dir);
+    for m in mods.iter() {
         if m.filename.ends_with(".disabled") {
             let _ = log_to_file(&format!("[INFO] Skipping disabled mod: {}", &m.filename));
             continue;
         }
 
-        if !needs_update(&mods_dir, &m.filename) {
-            let _ = log_to_file(&format!("[INFO] Skipping already up to date mod: {}", &m.filename));
+        let mod_name = match extract_mod_name(&m.filename) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let new_version = match extract_version(&m.filename) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let existing = find_existing_versions(&mods_path, mod_name);
+
+        let mut needs_download = true;
+        for (_, version) in &existing {
+            if version == new_version {
+                let _ = log_to_file(&format!("[INFO] Skipping already up to date mod: {}", &m.filename));
+                needs_download = false;
+            }
+        }
+
+        if !needs_download {
             continue;
         }
 
-        let path = Path::new(&mods_dir).join(&m.filename);
-        if path.exists() {
-            remove_file(path)?;
+        for (path, _) in existing {
+            let _ = log_to_file(&format!("[INFO]  Attempting to remove existing file: {}", &path.to_string_lossy().to_string()));
+            let _ = fs::remove_file(&path);
         }
 
         match &m.url {
@@ -93,36 +114,112 @@ fn sync_mods(mods_dir: &String, path: &String, mods_file: &String, api_key: &Str
             }
         }
     }
+
+    clean_unused_mods(mods_path, &mods)?;
     return Ok(());
 }
 
-fn needs_update(mods_dir: &str, jar_file: &str) -> bool {
-    let new_path = Path::new(mods_dir).join(jar_file);
 
-    if !new_path.exists() {
-        return true;
+fn extract_mod_name(filename: &str) -> Option<&str> {
+    let name = filename.strip_suffix(".jar")?;
+
+    let bytes = name.as_bytes();
+    let mut i = 0;
+
+    // Find first digit that starts a version (digit + '.' later)
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            // Check if this looks like a version (digit followed by '.' somewhere)
+            if name[i..].contains('.') {
+                break;
+            }
+        }
+        i += 1;
     }
 
-    let entries = match fs::read_dir(mods_dir) {
-        std::result::Result::Ok(e) => e,
-        Err(_) => return true,
-    };
+    if i == bytes.len() {
+        return None;
+    }
 
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
+    let mut prefix = &name[..i];
 
-        if !file_name.ends_with(".jar") {
-            continue;
-        }
+    // Trim separators
+    prefix = prefix.trim_end_matches(&['-', '_'][..]);
 
-        if file_name == jar_file {
-            // same mod but different version
-            return false;
+    // Trim common loader suffixes
+    for suffix in ["-forge", "_forge", "-fabric", "_fabric", "-mc", "_mc"] {
+        if let Some(p) = prefix.strip_suffix(suffix) {
+            prefix = p;
+            break;
         }
     }
 
-    true
+    Some(prefix)
+}
+
+fn extract_version(filename: &str) -> Option<&str> {
+    let name = filename.strip_suffix(".jar")?;
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+
+    // Find end of version segment (last digit)
+    let mut end = len;
+    while end > 0 {
+        if bytes[end - 1].is_ascii_digit() {
+            break;
+        }
+        end -= 1;
+    }
+
+    if end == 0 {
+        return None;
+    }
+
+    // Find start of version segment (walk back to previous '-' or '_')
+    let mut start = end;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if b == b'-' || b == b'_' {
+            break;
+        }
+        start -= 1;
+    }
+
+    Some(&name[start..end])
+}
+
+fn find_existing_versions(mods_dir: &Path, mod_name: &str) -> Vec<(PathBuf, String)> {
+    let mut results = Vec::new();
+
+    if let std::result::Result::Ok(entries) = fs::read_dir(mods_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            if !file_name.ends_with(".jar") {
+                continue;
+            }
+
+            // Extract mod name
+            if let Some(name) = extract_mod_name(file_name) {
+                if name != mod_name {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // Extract full version segment (MC+mod)
+            if let Some(version_segment) = extract_version(file_name) {
+                results.push((path.clone(), version_segment.to_string())); // store owned String
+            }
+        }
+    }
+
+    results
 }
 
 fn get_file_id(project_id: &str, filename: &String, api_key: &String) -> Result<u64> {
@@ -187,6 +284,36 @@ fn stage_dir(dir: &str) -> Result<()> {
         create_dir_all(dir)?;
     }
     return Ok(());
+}
+
+fn clean_unused_mods(mods_dir: &Path, mods: &[Mod]) -> Result<()> {
+    use std::collections::HashSet;
+    let valid_filenames: HashSet<&str> = mods.iter().map(|m| m.filename.as_str()).collect();
+
+    for entry in fs::read_dir(mods_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !file_name.ends_with(".jar") {
+            continue;
+        }
+
+        if !valid_filenames.contains(file_name) {
+            let _ = log_to_file(&format!("[INFO]  Deleting removed mod: {}", file_name));
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    Ok(())
 }
 
 impl Config {
