@@ -1,5 +1,3 @@
-use std::arch::aarch64::uint64x1_t;
-
 use reqwest::Result;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use serde::Deserialize;
